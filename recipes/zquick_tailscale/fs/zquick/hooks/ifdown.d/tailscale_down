@@ -1,8 +1,0 @@
-#!/bin/bash
-
-# shellcheck disable=SC1091
-. /zquick/libexec/utils.sh
-
-qinitlog "Tailscale - Closing SSH sessions"
-pkill -HUP sshd
-pkill -HUP login

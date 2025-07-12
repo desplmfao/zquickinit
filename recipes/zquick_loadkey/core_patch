@@ -1,253 +1,159 @@
 _zquickinit_loadkey() {
+  local fs encroot keyinput ret
   fs="$1"
   encroot="$2"
 
-  keyformat=$(zfs get -H -o value keyformat "${encroot}")
-  [[ ! "$keyformat" == passphrase ]] && exit 0
+  gum style --bold --border double --align center \
+    --width 50 --margin "1 2" --padding "2 4" "Encrypted filesystem" "" "$fs" "encryptionroot=$encroot"
 
-  keylocation="$(zfs get -H -o value keylocation "${encroot}")"
-  if [[ $keylocation = file://* ]]; then
-
-    key="${keylocation#file://}"
-    key="${key#/}"
-    keydir=${key%/*}
-    keyfile=${key##*/}
-
-    # this may be part of a re-run, check to see if we've already saved a copy of the response
-    if [[ -e "/zquick/run/load_key/cache/$keydir/$keyfile" ]]; then
-      if zfs load-key -L prompt "${encroot}" <"/zquick/run/load_key/cache/$keydir/$keyfile"; then
-        return 0
-      fi
-    fi
-    if [[ -e "/zquick/run/load_key/cached/skip/$keydir/$keyfile" ]]; then
+  for i in $(seq 1 5); do
+    keyinput=$(gum input \
+      --placeholder="Type your key" \
+      --header="Enter passphrase for $encroot:" \
+      --password)
+    if [ -z "$keyinput" ]; then
+      printf "\n\n"
       return 1
     fi
-    gum style --bold --border double --align center \
-      --width 50 --margin "1 2" --padding "2 4" "Encrypted filesystem" "" "$fs" "encryptionroot=$encroot"
 
-    # shellcheck disable=SC2034
-    for i in $(seq 1 3); do
-      keyinput=$(gum input \
-        --placeholder="Type your key" \
-        --header="Enter passphrase for $encroot:" \
-        --password)
-      if [ -z "$keyinput" ]; then
-        printf "\n\n"
-        return 1
-      fi
-      echo "$keyinput" | zfs load-key -L prompt "${encroot}"
-      ret=$?
-      printf "\n\n"
-      if ((ret == 0)); then
-        mkdir -p "/zquick/run/load_key/cache/$keydir"
-        if [[ -e "/zquick/run/load_key/cache/$keydir/$keyfile" ]]; then
-          if ! gum confirm "The keylocation $keylocation is already in use. Overwrite?" --default="no"; then exit 1; fi
-        fi
-        mkdir -p "/zquick/run/load_key/cache/$keydir"
-        echo "$keyinput" >"/zquick/run/load_key/cache/$keydir/$keyfile"
-        return 0
-      fi
-    done
-    mkdir -p "/zquick/run/load_key/skip/$keydir"
-    echo "$keyinput" >"/zquick/run/load_key/skip/$keydir/$keyfile"
-  fi
+    echo "$keyinput" | zfs load-key -L prompt "${encroot}"
+    ret=$?
+    printf "\n\n"
+
+    if ((ret == 0)); then
+      return 0
+    fi
+  done
   return 1
 }
 
-# patch load_key to replace the load-key call with one that saves the key
 load_key() {
-  local fs encroot key keypath keyformat keylocation keysource hook_envs
+  local fs encroot keyformat
 
   fs="${1}"
   if [ -z "${fs}" ]; then
     zerror "fs is undefined"
     return 1
   fi
-  zdebug "fs set to ${fs}"
 
-  # Nothing to do if filesystem is not locked
-  if ! encroot="$(be_is_locked "${fs}")" || [ -z "${encroot}" ]; then
+  if ! encroot="$(be_is_locked "${fs}")"; then
     return 0
   fi
 
-  # Run load-key hooks, if they exist
-  hook_envs=(ZBM_LOCKED_FS="${fs}" ZBM_ENCRYPTION_ROOT="${encroot}")
-  if env "${hook_envs[@]}" /libexec/zfsbootmenu-run-hooks "load-key.d"; then
-    # If hooks ran, check if the filesystem has been unlocked
-    if ! be_is_locked "${fs}" >/dev/null; then
-      zdebug "fs ${fs} unlocked by user hooks"
-      return 0
-    fi
-  fi
-
-  # Default to 0 when unset
-  [ -n "${CLEAR_SCREEN}" ] || CLEAR_SCREEN=0
-  [ -n "${NO_CACHE}" ] || NO_CACHE=0
-
-  # If something goes wrong discovering key location, just prompt
-  if ! keylocation="$(zfs get -H -o value keylocation "${encroot}" 2>/dev/null) "; then
-    zdebug "failed to read keylocation on ${encroot}"
-    keylocation="prompt"
-  fi
-
-  if [ "${keylocation}" = "prompt" ]; then
-    zdebug "prompting for passphrase for ${encroot}"
-    if [ "${CLEAR_SCREEN}" -eq 1 ]; then
-      tput clear
-      tput cup 0 0
-    fi
-
-    zfs load-key -L prompt "${encroot}"
-    return $?
-  fi
-
-  # Strip file path, relative to root
-  key="${keylocation#file://}"
-  key="${key#/}"
-
-  if [ -e "/${key}" ]; then
-    # Prefer the actual path to the key file
-    keypath="/${key}"
-  elif keysource="$(be_keysource "${fs}")" && ! [ "${NO_CACHE}" -eq 1 ]; then
-    # Otherwise, try to pre-seed a cache location
-    # Don't care if this succeeds because it may already be cached
-    cache_key "${fs}" "${keylocation}"
-    # Cache loading may have unlocked this BE, don't try again
-    if ! be_is_locked "${fs}" >/dev/null 2>&1; then
-      zdebug "cache attempt has unlocked ${encroot}"
-      return 0
-    fi
-
-    # If the cached key exists, prefer it
-    if [ -e "${BASE}/.keys/${keysource}/${key}" ]; then
-      keypath="${BASE}/.keys/${keysource}/${key}"
-      zdebug "cached key path for $fs is ${keypath}"
-    fi
-  fi
-
-  # Load a key from a file, if possible and necessary
-  if [ -e "${keypath}" ] && be_is_locked "${fs}" >/dev/null 2>&1; then
-    if zfs load-key -L "file://${keypath}" "${encroot}"; then
-      zdebug "unlocked ${encroot} from key at ${keypath}"
-      return 0
-    fi
-  fi
-
-  # Otherwise, try to prompt for "passphrase" keys
-  keyformat="$(zfs get -H -o value keyformat "${encroot}")" || keyformat=""
+  keyformat="$(zfs get -H -o value keyformat "${encroot}")"
   if [ "${keyformat}" != "passphrase" ]; then
-    zdebug "unable to load key with format ${keyformat} for ${encroot}"
+    zdebug "Not a passphrase, can't prompt. Failing."
     return 1
   fi
 
-  if [ "${CLEAR_SCREEN}" -eq 1 ]; then
-    tput clear
-    tput cup 0 0
-  fi
-
-  # begin zquickinit patch
+  tput clear
   _zquickinit_loadkey "${fs}" "${encroot}"
-  # end zquickinit patch
+  return $?
 }
 
-# patch kexec_kernel to inject keys
 kexec_kernel() {
-  echo "${1}"
-  local selected fs kernel initramfs output hook_envs
+  local selected fs kernel initramfs output hook_envs cli_args mntp root_prefix ucode_path final_initrd
+  local boot_fs main_fs kernel_path initramfs_path kernel_version_string final_root_fs
 
-  selected="${1}"
-  if [ -z "${selected}" ]; then
-    zerror "fs, kernel, initramfs undefined"
+  IFS=$'\t' read -r main_fs _ _ <<<"${1}"
+  if [ -z "${main_fs}" ]; then
+    zerror "main fs is undefined"
     return 130
   fi
 
-  # zfs filesystem
-  # kernel
-  # initramfs
-  IFS=$'\t' read -r fs kernel initramfs <<<"${selected}"
+  zdebug "kexec target main_fs (be): ${main_fs}"
 
-  zdebug "fs: ${fs}, kernel: ${kernel}, initramfs: ${initramfs}"
+  boot_fs=$(zfs get -H -o value org.zfsbootmenu:bootfs "${main_fs}" 2>/dev/null || echo)
+  if [ -z "${boot_fs}" ] || [ "${boot_fs}" = "-" ]; then
+    boot_fs="${main_fs}"
+    zdebug "no separate bootfs defined, using main BE as bootfs: ${boot_fs}"
+  else
+    zdebug "found separate bootfs defined: ${boot_fs}"
+  fi
 
-  CLEAR_SCREEN=1 load_key "${fs}"
+  if be_is_locked "${boot_fs}"; then
+    zdebug "attempting to unlock bootfs: ${boot_fs}"
+    if ! CLEAR_SCREEN=1 load_key "${boot_fs}"; then
+      emergency_shell "failed to unlock boot filesystem $(colorize cyan "${boot_fs}")"
+      return 1
+    fi
+  else
+    zdebug "bootfs '${boot_fs}' is not locked."
+  fi
 
   tput cnorm
   tput clear
 
-  if ! mnt=$(mount_zfs "${fs}"); then
-    emergency_shell "unable to mount $(colorize cyan "${fs}")"
+  if ! mntp=$(mount_zfs "${boot_fs}"); then
+    emergency_shell "unable to mount boot filesystem $(colorize cyan "${boot_fs}")"
     return 1
   fi
 
-  # Variables to tell user hooks what BE has been selected
-  hook_envs=(
-    ZBM_SELECTED_BE="${fs}"
-    ZBM_SELECTED_KERNEL="${kernel}"
-    ZBM_SELECTED_INITRAMFS="${initramfs}"
-  )
+  zdebug "mounted ${boot_fs} at ${mntp}"
 
-  # Run boot-environment hooks, if they exist
-  env "${hook_envs[@]}" \
-    ZBM_SELECTED_MOUNTPOINT="${mnt}" \
-    /libexec/zfsbootmenu-run-hooks "boot-sel.d"
-
-  cli_args="$(load_be_cmdline "${fs}")"
-  root_prefix="$(find_root_prefix "${fs}" "${mnt}")"
-
-  # Begin zquickinit patch
-  initrd="${mnt}${initramfs}"
-
-  if [[ -d /zquick/run/load_key/cache ]]; then
-    temp_initrd=/tmp"${initrd}"
-    mkdir -p "$(dirname "${temp_initrd}")"
-    cp "${initrd}" "${temp_initrd}"
-    initrd_size=$(stat -c '%s' "${initrd}")
-    initrd_size=$(((initrd_size + 3) / 4 * 4))
-    truncate -s "${initrd_size}" "${temp_initrd}"
-    initrd="${temp_initrd}"
-
-    find /zquick/run/load_key/cache -print |
-      bsdtar -P --format=newc -c -f - -T - -n -s#/zquick/run/load_key/cache## |
-      zstd >>"${initrd}"
+  mapfile -t kernels < <(find "${mntp}" -type f -name 'vmlinuz-*' 2>/dev/null | sort -V)
+  if [ ${#kernels[@]} -eq 0 ]; then
+      umount "${mntp}"
+      emergency_shell "no kernels (vmlinuz-*) found in ${boot_fs}"
+      return 1
+  fi
+  kernel_path="${kernels[-1]}"
+  
+  mapfile -t initramfs_files < <(find "${mntp}" -type f -name 'initramfs-*.img' -o -name 'initrd.img-*' 2>/dev/null | sort -V)
+  kernel_version_string="${kernel_path##*/vmlinuz-}"
+  for initrd in "${initramfs_files[@]}"; do
+      if [[ "$initrd" == *"$kernel_version_string"* ]]; then
+          initramfs_path="$initrd"
+          break
+      fi
+  done
+  if [ -z "$initramfs_path" ] && [ ${#initramfs_files[@]} -gt 0 ]; then
+       initramfs_path="${initramfs_files[-1]}"
+  fi
+  if [ -z "$initramfs_path" ]; then
+      umount "${mntp}"
+      emergency_shell "no initramfs found in ${boot_fs}"
+      return 1
   fi
 
-  if ! output="$(kexec -a -l "${mnt}${kernel}" \
-    --initrd="${initrd}" \
-    --command-line="${root_prefix}${fs} ${cli_args}" 2>&1)"; then
-    zerror "unable to load ${mnt}${kernel} and ${initrd} into memory"
-    zerror "${output}"
-    umount "${mnt}"
-    timed_prompt -d 10 \
-      -m "$(colorize red 'Unable to load kernel or initramfs into memory')" \
-      -m "$(colorize orange "${mnt}${kernel}")" \
-      -m "$(colorize orange "${initrd}")"
+  ucode_path=
+  for ucode in intel-ucode.img amd-ucode.img; do
+      ucode_found=$(find "${mntp}" -name "${ucode}" | head -n 1)
+      if [ -n "${ucode_found}" ]; then
+          ucode_path=${ucode_found}
+          break
+      fi
+  done
 
-    return 1
+  if [ -n "${ucode_path}" ]; then
+    final_initrd="/tmp/final_initrd.img"
+    cat "${ucode_path}" "${initramfs_path}" > "${final_initrd}"
   else
-    if zdebug; then
-      zdebug "loaded ${mnt}${kernel} and ${initrd} into memory"
-      zdebug "kernel command line: '${root_prefix}${fs} ${cli_args}'"
-      zdebug "${output}"
-    fi
+    final_initrd="${initramfs_path}"
   fi
-  # End zquickinit patch
 
-  umount "${mnt}"
+  cli_args="$(load_be_cmdline "${main_fs}")"
+  
+  final_root_fs=$(zfs get -H -o value org.zfsbootmenu:rootfs "${main_fs}" 2>/dev/null || echo)
+  if [ -z "${final_root_fs}" ] || [ "${final_root_fs}" = "-" ]; then
+    final_root_fs="${main_fs}"
+    zdebug "org.zfsbootmenu:rootfs not set, using main be as root"
+  else
+    zdebug "using org.zfsbootmenu:rootfs property for root: ${final_root_fs}"
+  fi
 
-  while read -r _pool; do
-    if is_writable "${_pool}"; then
-      zdebug "${_pool} is read/write, exporting"
-      export_pool "${_pool}"
-    fi
-  done <<<"$(zpool list -H -o name)"
-
-  # Run teardown hooks, if they exist
-  env "${hook_envs[@]}" /libexec/zfsbootmenu-run-hooks "teardown.d"
-
-  if ! output="$(kexec -e -i 2>&1)"; then
-    zerror "kexec -e -i failed!"
-    zerror "${output}"
-    timed_prompt -d 10 \
-      -m "$(colorize red "kexec run of ${kernel} failed!")"
+  # fuck everything dawg
+  root_prefix="zfs="
+  
+  if ! output="$(kexec -a -l "${kernel_path}" \
+    --initrd="${final_initrd}" \
+    --command-line="${root_prefix}${final_root_fs} ${cli_args}" 2>&1)"; then
+    zerror "unable to load kernel/initramfs"
+    umount "${mntp}"
     return 1
   fi
+  
+  umount "${mntp}"
+  export_pool "" "${main_fs}"
+  kexec -e -i
 }

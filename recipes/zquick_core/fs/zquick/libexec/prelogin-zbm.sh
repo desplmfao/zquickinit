@@ -2,7 +2,7 @@
 # vim: softtabstop=2 shiftwidth=2 expandtab
 
 # This file was mostly copied and serves the same function as "zfsbootmenu-init" from the zfsbootmenu project
-# It has been adapted to exit instead of launch an emergecy shell
+# It has been adapted to exit instead of launch an emergency shell
 
 # disable ctrl-c (SIGINT)
 trap '' SIGINT
@@ -248,14 +248,12 @@ if [ "${menu_timeout}" -ge 0 ] && [ -n "${BOOTFS}" ]; then
     # This lock file is present if someone has SSH'd to take control
     # Do not attempt to automatically boot if present
     if [ ! -e "${BASE}/active" ]; then
-      # Clear screen before a possible password prompt
+      # hand off all the logic to the kexec kernel func
       tput clear
-      if ! NO_CACHE=1 load_key "${BOOTFS}"; then
-        stop "unable to load key for $(colorize cyan "${BOOTFS}")"
-      elif find_be_kernels "${BOOTFS}" && [ ! -e "${BASE}/active" ]; then
-        # Automatically select a kernel and boot it
-        kexec_kernel "$(select_kernel "${BOOTFS}")"
-      fi
+      kexec_kernel "${BOOTFS}"
+
+      zerror "automatic boot failed. proceeding to main menu."
+      sleep 3
     fi
   fi
 fi

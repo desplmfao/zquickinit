@@ -1,3 +1,0 @@
-xbps-packages:
- - tailscale
-help: Tailscale support, including SSH and Funnel. 
