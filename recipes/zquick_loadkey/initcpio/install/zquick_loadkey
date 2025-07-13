@@ -11,5 +11,10 @@ build() {
     # shellcheck disable=SC2154
     cat "$zquickinit_root/recipes/zquick_loadkey/core_patch" >> "${BUILDROOT}/lib/zfsbootmenu-core.sh"
 
+    # doesn't change anything right now
+    msg2 "Note: monkey-patching zfsbootmenu-ui.sh"
+    # shellcheck disable=SC2154
+    cat "$zquickinit_root/recipes/zquick_loadkey/ui_patch" >> "${BUILDROOT}/lib/zfsbootmenu-ui.sh"
+
     zquick_add_fs
 }
