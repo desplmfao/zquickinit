@@ -10,7 +10,7 @@
 
 # Use the official Void Linux container
 FROM ghcr.io/void-linux/void-glibc-full 
-LABEL org.opencontainers.image.source=https://github.com/midzelis/zquickinit
+LABEL org.opencontainers.image.source=https://github.com/desplmfao/zquickinit
 
 ARG XBPS_REPOS="https://repo-fastly.voidlinux.org/current https://repo-fastly.voidlinux.org/current/nonfree"
 
@@ -20,7 +20,7 @@ ARG XBPS_REPOS="https://repo-fastly.voidlinux.org/current https://repo-fastly.vo
 #
 # Default: install 5.10, 5.15, 6.1 and 6.2
 #
-# (multiple entries must be seperated by spaces)
+# (multiple entries must be separated by spaces)
 ARG KERNELS="linux5.10 linux5.15 linux6.1 linux6.2 linux6.6 linux6.8" 
 
 # Run the following within an external cache (/var/cache/xbps) for the 
@@ -76,9 +76,9 @@ RUN <<-EOF
 
 # Include the specified Void Linux package in the image
 #
-# (multiple entries must be seperated by spaces)
+# (multiple entries must be separated by spaces)
 ARG PACKAGES=
-# Run ${PACKAGES} install in seperate layer so that the zfs dkms packages 
+# Run ${PACKAGES} install in separate layer so that the zfs dkms packages 
 # are not rebuilt when ${PACKAGES} change. reuse. Additionally: use xbps cache. 
 RUN --mount=type=cache,target=/var/cache/xbps <<-EOF 
 

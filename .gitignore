@@ -12,3 +12,4 @@ cache
 *sshd_config*
 *.code-workspace
 authorized_keys
+packaged*

@@ -19,7 +19,7 @@ First boot of Proxmox on encrypted partition, after install...
 
 Let me try! 
 ```
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/midzelis/zquickinit/main/zquickinit.sh)"
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/desplmfao/zquickinit/main/zquickinit.sh)"
 ```
 
 ## Features
@@ -89,14 +89,14 @@ The main script is runnable directly from curl/bash. However, if you want more c
 
 ### Running from curl: 
 ```
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/midzelis/zquickinit/main/zquickinit.sh)"
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/desplmfao/zquickinit/main/zquickinit.sh)"
 ```
 
 It will ask you if you want to download the EFI image, or run a "playground" that will boot the image in a QEMU VM. 
 
 ### Building from source
 ```
-git clone https://github.com/midzelis/zquickinit.git
+git clone https://github.com/desplmfao/zquickinit.git
 cd zquickinit
 ./zquickinit.sh # this will show help screen
 ```

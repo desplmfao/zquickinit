@@ -27,12 +27,23 @@ SRC_ROOT=${DIR}
 ZBM_ROOT=${SRC_ROOT}/../zfsbootmenu
 RECIPES_ROOT=${RECIPES_ROOT:-${SRC_ROOT}/recipes}
 
-RECIPE_BUILDER="ghcr.io/midzelis/zquickinit"
-ZQUICKEFI_URL="https://github.com/midzelis/zquickinit/releases/latest"
+RECIPE_BUILDER="${RECIPE_BUILDER:-ghcr.io/midzelis/zquickinit}"
+ZQUICKINIT_REPO="${ZQUICKINIT_REPO:-https://github.com/desplmfao/zquickinit}"
+ZQUICKEFI_URL="${ZQUICKEFI_URL:-${ZQUICKINIT_REPO}/releases/latest}"
 # if empty, use latest release tag
-ZBM_TAG=
+ZBM_TAG="${ZBM_TAG:-v3.0.1}"
+# if empty, then unset to get latest release
+if [[ -z "$ZBM_TAG" ]]; then
+	ZBM_TAG=""
+fi
+
 # if specified, takes precedence over ZBM_TAG
-ZBM_COMMIT_HASH=db78c980f40937f3b4de8d85e7430f6553a39972
+ZBM_COMMIT_HASH="${ZBM_COMMIT_HASH:-}"
+# if ZBM_COMMIT_HASH is specified, unset ZBM_TAG
+if [[ -n "$ZBM_COMMIT_HASH" ]]; then
+	ZBM_TAG=""
+fi
+
 INPUT=/input
 OUTPUT=/output
 ADD_LOADER=
@@ -40,8 +51,10 @@ MKINIT_VERBOSE=
 KERNEL_BOOT=
 ENGINE=
 OBJCOPY=
+DU=
 FIND=
 YG=
+STAT=
 NOASK=0
 DEBUG=0
 ENTER=0
@@ -81,37 +94,21 @@ check() {
 	if ! command -v "$1" &>/dev/null && [[ $1 = mkinitcpio && $NOCONTAINER == 1 ]]; then
 		if [ ! -d ../mkinitcpio ]; then
 			echo "mkinitcpio not found, clone repo to $(pwd)/../mkinitcpio?"
-
-			# to build it, you need to do this:
-
-			# Package: *
-			# Pin: release a=stable
-			# Pin-Priority: 600
-
-			# Package: meson
-			# Pin: release a=testing
-			# Pin-Priority: 700
-
-			# and put deb http://deb.debian.org/debian testing main
-			# into /etc/apt/sources.list
-
 		else
 			export PATH="/usr/local/bin:$PATH"
 			return
 		fi
 	fi
 	if [[ $1 == docker || $1 == podman ]]; then
-		if command -v docker &>/dev/null; then
+		if [ -z "$ENGINE" ] && command -v docker &>/dev/null; then
 			ENGINE=docker
 			return 0
-		elif command -v podman &>/dev/null; then
+		elif [ -z "$ENGINE" ] && command -v podman &>/dev/null; then
 			ENGINE=podman
 			return 0
 		fi
 		if [[ -z "$ENGINE" ]]; then
 			echo "docker or podman not found."
-			echo "see https://docs.docker.com/engine/install/ or"
-			echo "https://podman.io/docs/installation"
 			exit 1
 		fi
 	fi
@@ -124,32 +121,17 @@ check() {
 			return 0
 		else
 			echo "yq (or yq-go) is required"
-			echo "try wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/bin/yq && chmod +x /usr/bin/yq"
 			exit 1
 		fi
 	fi
 	if [[ $1 == objcopy && -z "${OBJCOPY}" ]]; then
-		if [[ "$OSTYPE" == "darwin"* ]]; then
-			OBJCOPY=$(find /opt/homebrew /usr/local -name gobjcopy -print -quit 2>/dev/null || :)
-			if [[ -z ${OBJCOPY} ]]; then
-				echo "$1 not found. usually part of the $2 package"
-				echo "On MacOS, use brew to install binutils"
-				echo "Note: brew uses /usr/local/bin on Intel, and /opt/homebrew/bin on Apple"
-				exit 1
-			fi
-			return 0
-		else
-			OBJCOPY=objcopy
-		fi
+		OBJCOPY=objcopy
 	fi
+	
 	if ! command -v "$1" &>/dev/null; then
 		echo "$1 not found. usually part of the $2 package"
 		if [[ $1 == "gum" && -f "/etc/debian_version" ]]; then
-			echo "To install, try:"
-			echo 'sudo mkdir -p /etc/apt/keyrings'
-			echo 'curl -fsSL https://repo.charm.sh/apt/gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/charm.gpg'
-			echo 'echo "deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *" | sudo tee /etc/apt/sources.list.d/charm.list'
-			echo 'sudo apt update && sudo apt install gum'
+			echo "To install, try: sudo apt install gum"
 		fi
 		exit 1
 	fi
@@ -160,11 +142,29 @@ check() {
 			FIND="find"
 		fi
 		if [[ ! "$(${FIND} . --version 2>&1 | head -n1)" == *GNU* ]]; then
-			echo "find must be GNU flavored. Update or install findutils package. "
-			if [[ "$OSTYPE" == "darwin"* ]]; then
-				echo "On MacOS, use brew to install findutils"
-				echo "Note: brew uses /usr/local/bin on Intel, and /opt/homebrew/bin on Apple"
-			fi
+			echo "find must be GNU flavored."
+			exit 1
+		fi
+	fi
+	if [[ $1 == du ]] && [[ -z "${DU}" ]]; then
+		if command -v gdu &>/dev/null; then
+			DU="gdu"
+		else
+			DU="du"
+		fi
+		if [[ ! "$(${DU} --version 2>&1 | head -n1)" == *GNU* ]]; then
+			echo "du must be GNU flavored."
+			exit 1
+		fi
+	fi
+	if [[ $1 == stat ]] && [[ -z "${STAT}" ]]; then
+		if command -v gstat &>/dev/null; then
+			STAT="gstat"
+		else
+			STAT="stat"
+		fi
+		if [[ ! "$(${STAT} --version 2>&1 | head -n1)" == *GNU* ]]; then
+			echo "stat must be GNU flavored."
 			exit 1
 		fi
 	fi
@@ -197,6 +197,7 @@ builder() {
 	echo
 	cmd=("$ENGINE" build .
 		-t "$RECIPE_BUILDER"
+		--label org.opencontainers.image.source="${ZQUICKINIT_REPO}"
 		--build-arg KERNELS=linux6.6
 		--build-arg "PACKAGES=${packages[*]}"
 		--build-arg ZBM_COMMIT_HASH="${ZBM_COMMIT_HASH}"
@@ -212,6 +213,15 @@ builder() {
 
 # shellcheck disable=SC2317
 tailscale() {
+	make_zquick_initramfs() {
+		check gum gum
+		check mkinitcpio mkinitcpio
+		check stat stat
+
+		gum style --bold --border double --align center \
+			--width 50 --margin "1 2" --padding "0 2" "Welcome to ZQuickInit make initramfs"
+	}
+
 	check docker
 	mkdir -p state
 	$ENGINE run -it --hostname zquickinit-bootstrap --user "$(id -u):$(id -g)" -e TS_EXTRA_ARGS=--ssh -e TS_STATE_DIR=/state -v "$(pwd)"/state:/state tailscale/tailscale
@@ -223,24 +233,25 @@ tailscale() {
 # This command is designed to be ONLY run from inside the running container
 # shellcheck disable=SC2317
 make_zquick_initramfs() {
+	local hash
 	check gum gum
 	check mkinitcpio mkinitcpio
-
+	check stat stat
+	
 	gum style --bold --border double --align center \
 		--width 50 --margin "1 2" --padding "0 2" "Welcome to ZQuickInit make initramfs"
 
 	[[ -z $RUNNING_IN_CONTAINER ]] && echo _internal-run must be run from inside container && exit 1
 	if [[ ! -d "${INPUT}" ]]; then
-		local hash
 		echo "Downloading zquickinit"
 		rm -rf "${INPUT}"
-		git clone --quiet --depth 1 https://github.com/midzelis/zquickinit.git "${INPUT}"
+		git clone --quiet --depth 1 "${ZQUICKINIT_REPO}" "${INPUT}"
 		hash=$(cat /etc/zquickinit-commit-hash || echo '')
 		if [[ -n "${hash}" ]]; then
 			(cd "${INPUT}" && git fetch --depth 1 origin "$hash" && git checkout FETCH_HEAD)
 		fi
 	fi
-	[[ -x /etc/zquickinit-commit-hash ]] && (cd "${INPUT}" && git config --global --add safe.directory "${INPUT}" && /etc/zquickinit-commit-hash && git rev-parse HEAD >/etc/zquickinit-commit-hash && echo "ZQuickInit (https://github.com/midzelis/zquickinit) commit hash: $(git rev-parse --short HEAD) ($(git rev-parse HEAD))")
+	[[ -x /etc/zquickinit-commit-hash ]] && (cd "${INPUT}" && git config --global --add safe.directory "${INPUT}" && /etc/zquickinit-commit-hash && git rev-parse HEAD >/etc/zquickinit-commit-hash && echo "ZQuickInit (${ZQUICKINIT_REPO}) commit hash: $(git rev-parse --short HEAD) ($(git rev-parse HEAD))")
 
 	if [[ ! -f "${ZBM}/bin/generate-zbm" ]]; then
 		echo "Downloading latest zfsbootmenu"
@@ -265,13 +276,16 @@ make_zquick_initramfs() {
 		name="${name##*/}"
 		recipes+=("${name}")
 	done
-	# zquick_core must always happen at the begining, so remove it and add it back later
+	# zquick_core must always happen at the begining
 	# shellcheck disable=SC2206
 	recipes=(${recipes[@]/zquick_core/})
 
-	# zquick_end must always happen at the end, so remove it and add it back later
+	# zquick_end must always happen at the end
 	# shellcheck disable=SC2206
 	recipes=(${recipes[@]/zquick_end/})
+
+	# shellcheck disable=SC2206
+	recipes=(${recipes[@]/zquick_qemu/})
 
 	zquickinit="${INPUT}"
 	zquickinit_config="${zquickinit}"
@@ -305,6 +319,7 @@ make_zquick_initramfs() {
 			name="${recipe%/*}"
 			name="${name##*/}"
 			[[ $name == "zquick_core" ]] && continue
+			[[ $name == "zquick_qemu" ]] && continue
 			help+=" - \`$name\` - $($YG e '.help ' "$recipe")\n"
 		done
 
@@ -327,8 +342,6 @@ make_zquick_initramfs() {
 
 		text+=("# Which mkcpio system hooks would you like to include?")
 		text+=("See [Common Hooks](https://wiki.archlinux.org/title/mkinitcpio#Common_hooks) for more info. ")
-		text+=("")
-		((NOCONTAINER == 0)) && text+=("Note: mkcpio hook 'autodetect' won't work as expected when running within a container.")
 
 		gum format "${text[@]}" ""
 
@@ -368,18 +381,18 @@ make_zquick_initramfs() {
 			echo "${chosen_recipes[*]}"
 		)"
 		echo
-		if [[ $NOCONTAINER -eq 0 ]] && [[ "${chosen_systemhooks[*]}" =~ "autodetect" ]]; then
-			echo "NOTICE!! Removing autodetect hook"
-			echo
-			chosen_systemhooks=("${chosen_systemhooks[@]/autodetect/}")
-		fi
+	fi
 
-		if [[ $RELEASE == 1 ]] && [[ "${chosen_systemhooks[*]}" =~ "zquick_qemu" ]]; then
-			echo "NOTICE!!! Removing zquick_qemu"
-			echo
-			chosen_recipes=("${chosen_recipes[@]/zquick_qemu/}")
-		fi
+	if [[ "${chosen_systemhooks[*]}" =~ "autodetect" ]]; then
+		echo "NOTICE!! Strictly removing autodetect hook"
+		echo
+		chosen_systemhooks=("${chosen_systemhooks[@]/autodetect/}")
+	fi
 
+	if [[ "${chosen_recipes[*]}" =~ "zquick_qemu" ]]; then
+		echo "NOTICE!!! Strictly removing zquick_qemu"
+		echo
+		chosen_recipes=("${chosen_recipes[@]/zquick_qemu/}")
 	fi
 
 	hooks=()
@@ -392,7 +405,7 @@ make_zquick_initramfs() {
 	# then recipes
 	hooks+=("${chosen_recipes[@]}")
 
-	# If autodetect, ensure it goes first
+	# If autodetect, ensure it goes first (it shouldn't be here, but just in case logic fails elsewhere)
 	if [[ "${hooks[*]}" =~ "autodetect" ]]; then
 		# Remove "autodetect" from the array
 		hooks=("${hooks[@]/autodetect/}")
@@ -576,9 +589,9 @@ make_zquick_initramfs() {
 	)
 	chmod o+rw -R "${OUTPUT}"/*
 	chmod g+rw -R "${OUTPUT}"/*
-	env LC_ALL=en_US.UTF-8 printf "Kernel size: \t\t%'.0f bytes\n" "$(stat -c '%s' "${OUTPUT}/zquickinit-$build_time.vmlinuz-$kernel")"
-	env LC_ALL=en_US.UTF-8 printf "initramfs size: \t%'.0f bytes\n" "$(stat -c '%s' "$output_img")"
-	env LC_ALL=en_US.UTF-8 printf "EFI size: \t\t%'.0f bytes\n" "$(stat -c '%s' "$output_uki")"
+	env LC_ALL=en_US.UTF-8 printf "Kernel size: \t\t%'.0f bytes\n" "$($STAT -c '%s' "${OUTPUT}/zquickinit-$build_time.vmlinuz-$kernel")"
+	env LC_ALL=en_US.UTF-8 printf "initramfs size: \t%'.0f bytes\n" "$($STAT -c '%s' "$output_img")"
+	env LC_ALL=en_US.UTF-8 printf "EFI size: \t\t%'.0f bytes\n" "$($STAT -c '%s' "$output_uki")"
 	find "${OUTPUT}" -name 'zquickinit*.img' | sort -r | tail -n +4 | xargs -r rm
 	find "${OUTPUT}" -name 'zquickinit*.efi' | sort -r | tail -n +4 | xargs -r rm
 	find "${OUTPUT}" -name 'zquickinit*.vmlinuz-*' | sort -r | tail -n +4 | xargs -r rm
@@ -631,7 +644,7 @@ getefi() {
 		echo "No image found, finding latest release..."
 		local version='' download=''
 		version=$(curl --silent -qI "${ZQUICKEFI_URL}" | awk -F '/' '/^location/ {print  substr($NF, 1, length($NF)-1)}')
-		download="https://github.com/midzelis/zquickinit/releases/download/$version/zquickinit.efi"
+		download="${ZQUICKINIT_REPO}/releases/download/$version/zquickinit.efi"
 		source="${tmp}/zquickinit-${version}.efi"
 		echo "Downloading from ${download} to ${source}..."
 		curl -o "$source" --progress-bar -L "${download}"
@@ -639,6 +652,11 @@ getefi() {
 }
 
 inject() {
+	check bsdtar "libarchive-tools"
+	check objcopy binutils
+	check truncate coreutils
+	check find findutils
+	check stat coreutils
 
 	inject_secret() {
 
@@ -753,7 +771,7 @@ inject() {
 		# To append an additional initrd segment, the new archive must aligned to a
 		# 4-byte boundary: https://unix.stackexchange.com/a/737219
 
-		initrd_size=$(stat -c '%s' "${initrd}")
+		initrd_size=$($STAT -c '%s' "${initrd}")
 		initrd_size=$(((initrd_size + 3) / 4 * 4))
 		truncate -s "${initrd_size}" "${initrd}"
 
@@ -829,6 +847,7 @@ iso() {
 	check xorriso xorriso
 	check truncate coreutils
 	check find findutils
+	check du coreutils
 
 	local target=${1:-zquickinit.iso}
 	local source=${2:-}
@@ -844,7 +863,7 @@ iso() {
 	local isoroot="${tmp}/iso"
 	mkdir -p "${isoroot}"
 	local size
-	read -ra size <<<"$(du --apparent-size --block-size=1M "$source")"
+	read -ra size <<<"$($DU --apparent-size --block-size=1M "$source")"
 	local padded=$((size[0] + 12))
 	local part_img="${tmp}/efs_partition.img"
 	rm -rf "${part_img}"
@@ -878,6 +897,7 @@ playground() {
 	check truncate coreutils
 	check qemu-system-x86_64 qemu
 	check find findutils
+	check nproc coreutils
 
 	# shellcheck disable=SC2155
 	local tmp=$(tmpdir)
@@ -1048,7 +1068,6 @@ playground() {
 	set +e
 	read -n 1 -s -r -t 3 -p $'Press any key or wait to launch QEMU\n\n'
 	set -e
-	echo
 	echo "Starting..."
 	"${args[@]}"
 }
@@ -1069,6 +1088,12 @@ if [[ $(type -t "$command") == function ]]; then
 		-d | --debug)
 			DEBUG=1
 			set -x
+			;;
+		--engine)
+			if [[ -n ${2:-} ]]; then
+				ENGINE=$2
+				shift
+			fi
 			;;
 		-v)
 			MKINIT_VERBOSE="-v"
@@ -1187,6 +1212,7 @@ else
 	echo "                  Just use files in the current directory, if present."
 	echo "    --no-container Do not use containers to build initramfs"
 	echo "    --release     Do not add QEMU debug, or any secrets"
+	echo "    --engine      <docker|podman> Override automatic detection to use specific engine."
 	echo "    --secrets <dir> Use this folder for secrets."
 	echo "    -d,--debug    Advanced: Turn on tracing"
 	echo "    -e,--enter    Advanced: Do not build an image. Execute bash and"

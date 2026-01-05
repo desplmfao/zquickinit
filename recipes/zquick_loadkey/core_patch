@@ -1,256 +1,487 @@
 _zquickinit_loadkey() {
-  local fs encroot keyinput ret
-  fs="$1"
-  encroot="$2"
+   local fs encroot keyinput ret
+   fs="$1"
+   encroot="$2"
 
-  gum style --bold --border double --align center \
-    --width 50 --margin "1 2" --padding "2 4" "Encrypted filesystem" "" "$fs" "encryptionroot=$encroot"
+   {
+      echo
+      echo "Encrypted filesystem"
+      echo "$fs"
+      echo "encryptionroot=$encroot"
+      echo
+   } >&2
 
-  for i in $(seq 1 5); do
-    keyinput=$(gum input \
-      --placeholder="Type your key" \
-      --header="Enter passphrase for $encroot:" \
-      --password)
-    if [ -z "$keyinput" ]; then
-      printf "\n\n"
-      return 1
-    fi
+   for i in $(seq 1 5); do
+      keyinput=$(gum input \
+         --placeholder="Type your key" \
+         --header="Enter passphrase for $encroot:" \
+         --password)
+      if [ -z "$keyinput" ]; then
+         printf "\n\n" >&2
+         return 1
+      fi
 
-    echo "$keyinput" | zfs load-key -L prompt "${encroot}"
-    ret=$?
-    printf "\n\n"
+      echo "$keyinput" | zfs load-key -L prompt "${encroot}"
+      ret=$?
+      printf "\n\n" >&2
 
-    if ((ret == 0)); then
-      return 0
-    fi
-  done
+      if ((ret == 0)); then
+         return 0
+      fi
+   done
 
-  return 1
+   return 1
 }
 
 load_key() {
-  local fs encroot keyformat
+   local fs encroot keyformat
 
-  fs="${1}"
-  if [ -z "${fs}" ]; then
-    zerror "fs is undefined"
-    return 1
-  fi
+   fs="${1}"
+   if [ -z "${fs}" ]; then
+      zerror "fs is undefined"
+      return 1
+   fi
 
-  if ! encroot="$(be_is_locked "${fs}")"; then
-    return 0
-  fi
+   if ! encroot="$(be_is_locked "${fs}")"; then
+      return 0
+   fi
 
-  keyformat="$(zfs get -H -o value keyformat "${encroot}")"
-  if [ "${keyformat}" != "passphrase" ]; then
-    zdebug "not a passphrase, can't prompt. failing."
-    return 1
-  fi
+   keyformat="$(zfs get -H -o value keyformat "${encroot}")"
+   if [ "${keyformat}" != "passphrase" ]; then
+      zdebug "not a passphrase, can't prompt. failing."
+      return 1
+   fi
 
-  tput clear
-  _zquickinit_loadkey "${fs}" "${encroot}"
-  return $?
+   tput clear >&2
+   _zquickinit_loadkey "${fs}" "${encroot}"
+   return $?
+}
+
+load_be_cmdline() {
+   local fs bootfs cmdopts
+
+   fs="${1}"
+   if [ -z "${fs}" ]; then
+      return 1
+   fi
+
+   bootfs="$(zfs get -H -o value org.zfsbootmenu:bootfs "${fs}" 2>/dev/null)"
+
+   if [ "${bootfs}" = "-" ] || [ -z "${bootfs}" ]; then
+      bootfs="${fs}"
+   fi
+
+   cmdopts="$( zfs get -H -o value org.zfsbootmenu:cmdopts "${bootfs}" 2>/dev/null )"
+
+   if [ "${cmdopts}" = "-" ] || [ -z "${cmdopts}" ]; then
+      cmdopts="$( zfs get -H -o value org.zfsbootmenu:cmdopts "${fs}" 2>/dev/null )"
+   fi
+
+   if [ "${cmdopts}" = "-" ] || [ -z "${cmdopts}" ]; then
+      echo "quiet loglevel=4"
+   else
+      echo "${cmdopts}"
+   fi
+}
+
+# override to respect org.zfsbootmenu:{bootfs,kernel,initramfs}
+find_be_kernels() {
+   local fs mnt
+   local kpath ipath kernel_records
+   local prop_bootfs prop_kernel prop_initramfs target_fs be_dir
+
+   fs="${1}"
+   if [ -z "${fs}" ]; then
+      zerror "fs is undefined"
+      return 1
+   fi
+   zdebug "fs set to ${fs}"
+
+   prop_bootfs="$(zfs get -H -o value org.zfsbootmenu:bootfs "${fs}" 2>/dev/null)"
+   if [ "${prop_bootfs}" != "-" ] && [ -n "${prop_bootfs}" ]; then
+      target_fs="${prop_bootfs}"
+      zdebug "using explicit bootfs: ${target_fs}"
+   else
+      target_fs="${fs}"
+   fi
+
+   be_dir="$( be_location "${fs}" )"
+   kernel_records="${be_dir}/kernels"
+   : > "${kernel_records}"
+
+   prop_kernel="$(zfs get -H -o value org.zfsbootmenu:kernel "${fs}" 2>/dev/null)"
+   prop_initramfs="$(zfs get -H -o value org.zfsbootmenu:initramfs "${fs}" 2>/dev/null)"
+
+   if [ "${prop_kernel}" != "-" ] && [ -n "${prop_kernel}" ] && \
+      [ "${prop_initramfs}" != "-" ] && [ -n "${prop_initramfs}" ]; then
+
+      prop_kernel="${prop_kernel%\$}"
+
+      [[ "${prop_kernel}" != /* ]] && prop_kernel="/${prop_kernel}"
+      [[ "${prop_initramfs}" != /* ]] && prop_initramfs="/${prop_initramfs}"
+
+      zdebug "adding configured kernel (${prop_kernel}) and initramfs (${prop_initramfs})"
+      printf "%s\t%s\t%s\n" "${fs}" "${prop_kernel}" "${prop_initramfs}" >> "${kernel_records}"
+      
+      if [ -z "${ZQUICK_KERNEL_SCAN}" ]; then
+         zdebug "lazy scan: returning early with configured defaults"
+         return 0
+      fi
+   fi
+
+   load_key "${target_fs}"
+
+   if ! mnt="$( mount_zfs "${target_fs}" 2>&1 )"; then
+      zerror "unable to mount ${target_fs}"
+      [ -s "${kernel_records}" ] && return 0
+      return 1
+   fi
+
+   while read -r kpath; do
+      [ -n "${kpath}" ] || continue;
+      kpath="${kpath#"${mnt}"}"
+      kpath="/${kpath#/}"
+
+      if [ "${kpath}" = "${prop_kernel}" ]; then
+         continue
+      fi
+
+      if ipath="$( find_be_initramfs "${mnt}${kpath}" )"; then
+         zdebug "found kernel: ${mnt}${kpath}, initramfs ${mnt}${ipath}"
+         ipath="${ipath#"${mnt}"}"
+         ipath="/${ipath#/}"
+         printf "%s\t%s\t%s\n" "${fs}" "${kpath}" "${ipath}" >> "${kernel_records}"
+      else
+         zdebug "kernel ${mnt}${kpath} has no initramfs"
+      fi
+   done <<<"$(
+      for k in "${mnt}"/{{vm,}linu{x,z},kernel}{,-*} "${mnt}/boot"/{{vm,}linu{x,z},kernel}{,-*}; do
+         [ -e "${k}" ] && echo "${k}"
+      done | sort -V
+   )"
+
+   umount "${mnt}"
+
+   [ -s "${kernel_records}" ] && select_kernel "${fs}" >/dev/null && return 0
+
+   zerror "failed to find kernels on ${target_fs} (for ${fs})"
+   rm -f "${kernel_records}"
+   return 1
+}
+
+zfs_chroot() {
+   local fs boot_fs prop_bootfs prop_rootfs target_fs
+
+   fs="${1}"
+   if [ -z "${fs}" ]; then
+      zerror "fs is undefined"
+
+      return 1
+   fi
+
+   zdebug "fs set to ${fs}"
+
+   if ! load_key "${fs}"; then
+      zerror "failed to unlock ${fs}"
+
+      return 1
+   fi
+
+   prop_bootfs=$(zfs get -H -o value org.zfsbootmenu:bootfs "${fs}" 2>/dev/null || echo)
+   if [ "${prop_bootfs}" != "-" ] && [ -n "${prop_bootfs}" ] && [ "${prop_bootfs}" != "${fs}" ]; then
+      boot_fs="${prop_bootfs}"
+      zdebug "unlocking explicit bootfs: ${boot_fs}"
+
+      if ! load_key "${boot_fs}"; then
+         zerror "failed to unlock ${boot_fs}"
+
+         return 1
+      fi
+   fi
+
+   prop_rootfs=$(zfs get -H -o value org.zfsbootmenu:rootfs "${fs}" 2>/dev/null || echo)
+   if [ "${prop_rootfs}" != "-" ] && [ -n "${prop_rootfs}" ]; then
+      target_fs="${prop_rootfs}"
+      zdebug "using explicit rootfs for chroot: ${target_fs}"
+      
+      if ! load_key "${target_fs}"; then
+         zerror "failed to unlock target rootfs ${target_fs}"
+
+         return 1
+      fi
+   else
+      target_fs="${fs}"
+   fi
+
+   tput clear
+   tput cnorm
+
+   zdebug "chroot environment: ${target_fs}"
+   /bin/bash -c "zfs-chroot ${target_fs}"
 }
 
 kexec_kernel() {
-  local selected fs kernel initramfs output hook_envs cli_args mntp root_prefix ucode_path final_initrd
-  local boot_fs main_fs kernel_path initramfs_path kernel_version_string final_root_fs pool_name
-  local dtb_prop dtb_try dtb_file kver
+   local selected fs kernel initramfs output hook_envs cli_args mntp root_prefix ucode_path final_initrd
+   local boot_fs main_fs kernel_path initramfs_path kernel_version_string final_root_fs pool_name
+   local dtb_prop dtb_try dtb_file kver prop_bootfs prop_rootfs prop_initramfs
+   local input_kernel input_initramfs
 
-  IFS=$'\t' read -r main_fs _ _ <<<"${1}"
-  if [ -z "${main_fs}" ]; then
-    zerror "main fs is undefined"
-    return 130
-  fi
-  zdebug "kexec target main_fs (be): ${main_fs}"
+   IFS=$'\t' read -r main_fs input_kernel input_initramfs <<<"${1}"
+   
+   if [ -z "${main_fs}" ]; then
+      zerror "main fs is undefined"
+      return 130
+   fi
+   zdebug "kexec target main_fs (be): ${main_fs}"
 
-  boot_fs=$(zfs get -H -o value org.zfsbootmenu:bootfs "${main_fs}" 2>/dev/null || echo)
-  if [ -z "${boot_fs}" ] || [ "${boot_fs}" = "-" ]; then
-    boot_fs="${main_fs}"
-  fi
-  zdebug "using bootfs: ${boot_fs}"
+   # 1. determine bootfs
+   prop_bootfs=$(zfs get -H -o value org.zfsbootmenu:bootfs "${main_fs}" 2>/dev/null || echo)
+   if [ "${prop_bootfs}" != "-" ] && [ -n "${prop_bootfs}" ]; then
+      boot_fs="${prop_bootfs}"
+      zdebug "using explicit bootfs source: ${boot_fs}"
+   else
+      boot_fs="${main_fs}"
+   fi
 
-  final_root_fs=$(zfs get -H -o value org.zfsbootmenu:rootfs "${main_fs}" 2>/dev/null || echo)
-  if [ -z "${final_root_fs}" ] || [ "${final_root_fs}" = "-" ]; then
-    final_root_fs="${main_fs}"
-  fi
-  zdebug "using rootfs: ${final_root_fs}"
+   prop_rootfs=$(zfs get -H -o value org.zfsbootmenu:rootfs "${main_fs}" 2>/dev/null || echo)
+   if [ "${prop_rootfs}" != "-" ] && [ -n "${prop_rootfs}" ]; then
+      final_root_fs="${prop_rootfs}"
+      zdebug "using explicit rootfs argument: ${final_root_fs}"
+   else
+      final_root_fs="${main_fs}"
+   fi
 
-  if be_is_locked "${boot_fs}"; then
-    if ! CLEAR_SCREEN=1 load_key "${boot_fs}"; then
-      emergency_shell "failed to unlock boot filesystem $(colorize cyan "${boot_fs}")"
+   if be_is_locked "${boot_fs}"; then
+      if ! CLEAR_SCREEN=1 load_key "${boot_fs}"; then
+         emergency_shell "failed to unlock boot filesystem $(colorize cyan "${boot_fs}")"
+         return 1
+      fi
+   fi
+
+   tput cnorm
+   tput clear
+
+   if ! mntp=$(mount_zfs "${boot_fs}"); then
+      emergency_shell "unable to mount boot filesystem $(colorize cyan "${boot_fs}")"
       return 1
-    fi
-  fi
+   fi
 
-  tput cnorm
-  tput clear
+   kernel_path=""
+   initramfs_path=""
 
-  if ! mntp=$(mount_zfs "${boot_fs}"); then
-    emergency_shell "unable to mount boot filesystem $(colorize cyan "${boot_fs}")"
-    return 1
-  fi
-  
-  mapfile -t kernels < <(find "${mntp}" -type f -name 'vmlinuz-*' 2>/dev/null | sort -V)
-  kernel_path="${kernels[-1]}"
+   if [ -n "${input_kernel}" ] && [ -f "${mntp}${input_kernel}" ]; then
+      zdebug "using user selected kernel: ${input_kernel}"
+      kernel_path="${mntp}${input_kernel}"
+      
+      if [ -n "${input_initramfs}" ] && [ -f "${mntp}${input_initramfs}" ]; then
+         initramfs_path="${mntp}${input_initramfs}"
+      fi
+   fi
 
-  mapfile -t initramfs_files < <(find "${mntp}" -type f -name 'initramfs-*.img' -o -name 'initrd.img-*' 2>/dev/null | sort -V)
-  kernel_version_string="${kernel_path##*/vmlinuz-}"
-  for initrd in "${initramfs_files[@]}"; do
-    if [[ "$initrd" == *"$kernel_version_string"* ]]; then
-      initramfs_path="$initrd"
-      break
-    fi
-  done
+   if [ -z "${kernel_path}" ]; then
+      prop_kernel="$(zfs get -H -o value org.zfsbootmenu:kernel "${main_fs}" 2>/dev/null)"
+      prop_initramfs="$(zfs get -H -o value org.zfsbootmenu:initramfs "${main_fs}" 2>/dev/null)"
 
-  [ -z "$initramfs_path" ] && initramfs_path="${initramfs_files[-1]}"
+      if [ "${prop_kernel}" != "-" ] && [ -n "${prop_kernel}" ]; then
+         prop_kernel="${prop_kernel%\$}"
+         [[ "${prop_kernel}" != /* ]] && prop_kernel="/${prop_kernel}"
+         if [ -f "${mntp}${prop_kernel}" ]; then
+            kernel_path="${mntp}${prop_kernel}"
+            
+            if [ "${prop_initramfs}" != "-" ] && [ -n "${prop_initramfs}" ]; then
+               [[ "${prop_initramfs}" != /* ]] && prop_initramfs="/${prop_initramfs}"
+               if [ -f "${mntp}${prop_initramfs}" ]; then
+                  initramfs_path="${mntp}${prop_initramfs}"
+               fi
+            fi
+         fi
+      fi
+   fi
 
-  ucode_path=
-  for ucode in intel-ucode.img amd-ucode.img; do
-    ucode_found=$(find "${mntp}" -name "${ucode}" | head -n 1)
-    if [ -n "${ucode_found}" ]; then
-      ucode_path=${ucode_found};
-      break; 
-    fi
-  done
+   if [ -z "${kernel_path}" ]; then
+      zdebug "scanning for kernels on ${mntp}"
+      mapfile -t kernels < <(
+         for k in "${mntp}"/{{vm,}linu{x,z},kernel}{,-*} "${mntp}/boot"/{{vm,}linu{x,z},kernel}{,-*}; do
+            [ -e "${k}" ] && echo "${k}"
+         done | sort -V
+      )
+      
+      if [ ${#kernels[@]} -gt 0 ]; then
+         kernel_path="${kernels[-1]}"
+      fi
+   fi
 
-  if [ -n "${ucode_path}" ]; then
-    final_initrd="/tmp/final_initrd.img"
-    cat "${ucode_path}" "${initramfs_path}" > "${final_initrd}"
-  else
-    final_initrd="${initramfs_path}"
-  fi
+   if [ -z "${kernel_path}" ]; then
+      zerror "No kernel found on ${boot_fs}"
+      umount "${mntp}"
+      return 1
+   fi
 
-  hook_envs=( 
-    ZBM_SELECTED_BE="${main_fs}" 
-    ZBM_SELECTED_KERNEL="${kernel_path}" 
-    ZBM_SELECTED_INITRAMFS="${initramfs_path}" 
-    ZBM_FINAL_INITRD="${final_initrd}"
-  )
+   if [ -z "${initramfs_path}" ]; then
+      if found_initrd="$( find_be_initramfs "${kernel_path}" )"; then
+         initramfs_path="${found_initrd}"
+      else
+         mapfile -t initramfs_files < <(find "${mntp}" -type f -name 'initramfs-*.img' -o -name 'initrd.img-*' 2>/dev/null | sort -V)
+         if [ ${#initramfs_files[@]} -eq 0 ]; then
+            mapfile -t initramfs_files < <(find "${mntp}/boot" -type f -name 'initramfs-*.img' -o -name 'initrd.img-*' 2>/dev/null | sort -V)
+         fi
 
-  env "${hook_envs[@]}" ZBM_SELECTED_MOUNTPOINT="${mntp}" /libexec/zfsbootmenu-run-hooks "boot-sel.d"
+         kernel_version_string="${kernel_path##*/vmlinuz-}"
+         for initrd in "${initramfs_files[@]}"; do
+            if [[ "$initrd" == *"$kernel_version_string"* ]]; then
+               initramfs_path="$initrd"
+               break
+            fi
+         done
+         [ -z "$initramfs_path" ] && [ ${#initramfs_files[@]} -gt 0 ] && initramfs_path="${initramfs_files[-1]}"
+      fi
+   fi
 
-  root_prefix="$( zfs get -H -o value org.zfsbootmenu:rootprefix "${boot_fs}" 2>/dev/null )"
-  if [ -z "${root_prefix}" ] || [ "${root_prefix}" = "-" ]; then
-    zdebug "org.zfsbootmenu:rootprefix not set, running auto-detection"
-    root_prefix="$( find_root_prefix "${boot_fs}" "${mntp}" )"
-  else
-    zdebug "using explicit org.zfsbootmenu:rootprefix='${root_prefix}'"
-  fi
+   if [ -z "${initramfs_path}" ] || [ ! -f "${initramfs_path}" ]; then
+      zerror "No initramfs found for kernel ${kernel_path}"
+   fi
 
-  cli_args="$( load_be_cmdline "${boot_fs}" )"
-  zdebug "base args from load_be_cmdline: '${cli_args}'"
+   ucode_path=
+   for ucode in intel-ucode.img amd-ucode.img; do
+      ucode_found=$(find "${mntp}" -name "${ucode}" | head -n 1)
+      if [ -n "${ucode_found}" ]; then
+         ucode_path=${ucode_found};
+         break;
+      fi
+   done
 
-  real_cli_args="$( zfs get -H -o value org.zfsbootmenu:cmdopts "${boot_fs}" 2>/dev/null )"
-  if [ "${real_cli_args}" = "-" ]; then
-    real_cli_args=""
-  fi
-  zdebug "additional args to append: '${real_cli_args}'"
+   if [ -n "${ucode_path}" ] && [ -n "${initramfs_path}" ]; then
+      final_initrd="/tmp/final_initrd.img"
+      cat "${ucode_path}" "${initramfs_path}" > "${final_initrd}"
+   else
+      final_initrd="${initramfs_path}"
+   fi
 
-  dtb_prop="$( zfs get -H -o value org.zfsbootmenu:devicetree "${boot_fs}" 2>/dev/null )"
-  if [ -n "${dtb_prop}" ] && [ "${dtb_prop}" != '-' ] ; then
-    kver="${kernel_path##*/vmlinuz-}"
-    dtb_try="${mntp}${dtb_prop//%\{kernel\}/${kver}}"
-    [ -f "${dtb_try}" ] && dtb_file="${dtb_try}"
-  fi
+   hook_envs=(
+      ZBM_SELECTED_BE="${main_fs}"
+      ZBM_SELECTED_KERNEL="${kernel_path}"
+      ZBM_SELECTED_INITRAMFS="${initramfs_path}"
+      ZBM_FINAL_INITRD="${final_initrd}"
+   )
 
-  zdebug "${root_prefix}${final_root_fs} ${real_cli_args} spl.splhostid=0x00000000"
+   env "${hook_envs[@]}" ZBM_SELECTED_MOUNTPOINT="${mntp}" /libexec/zfsbootmenu-run-hooks "boot-sel.d"
 
-  if ! output="$(kexec -a -l "${kernel_path}" \
-    --initrd="${final_initrd}" \
-    ${dtb_file:+--dtb="${dtb_file}"} \
-    --command-line="${root_prefix}${final_root_fs} ${real_cli_args} spl.splhostid=0x00000000" 2>&1)"; then
-    zerror "kexec -l failed: ${output}"
-    umount "${mntp}"
-    return 1
-  fi
-  
-  umount "${mntp}"
+   root_prefix="$( zfs get -H -o value org.zfsbootmenu:rootprefix "${main_fs}" 2>/dev/null )"
+   if [ -z "${root_prefix}" ] || [ "${root_prefix}" = "-" ]; then
+      root_prefix="$( zfs get -H -o value org.zfsbootmenu:rootprefix "${boot_fs}" 2>/dev/null )"
+   fi
 
-  while read -r _pool; do
-    if is_writable "${_pool}"; then
-      zdebug "${_pool} is read/write, exporting"
-      export_pool "${_pool}"
-    fi
-  done <<<"$( zpool list -H -o name )"
+   if [ -z "${root_prefix}" ] || [ "${root_prefix}" = "-" ]; then
+      zdebug "org.zfsbootmenu:rootprefix not set, running auto-detection"
+      root_prefix="$( find_root_prefix "${boot_fs}" "${mntp}" )"
+   else
+      zdebug "using explicit org.zfsbootmenu:rootprefix='${root_prefix}'"
+   fi
 
-  env "${hook_envs[@]}" /libexec/zfsbootmenu-run-hooks "teardown.d"
+   cli_args="$( load_be_cmdline "${main_fs}" )"
+   zdebug "base args from load_be_cmdline: '${cli_args}'"
 
-  echo -e "\nBooting $( colorize yellow "${kernel_path##*/}" ) for $( colorize cyan "${main_fs}" ) ...\n"
+   real_cli_args="$( zfs get -H -o value org.zfsbootmenu:cmdopts "${main_fs}" 2>/dev/null )"
+   if [ "${real_cli_args}" = "-" ] || [ -z "${real_cli_args}" ]; then
+      real_cli_args="$( zfs get -H -o value org.zfsbootmenu:cmdopts "${boot_fs}" 2>/dev/null )"
+   fi
 
-  if ! output="$( kexec -e -i 2>&1 )"; then
-    zerror "kexec -e failed: ${output}"
-    return 1
-  fi
+   if [ "${real_cli_args}" = "-" ]; then
+      real_cli_args=""
+   fi
+   zdebug "additional args to append: '${real_cli_args}'"
+
+   zdebug "${root_prefix}${final_root_fs} ${real_cli_args} spl.splhostid=0x00000000"
+
+   if ! output="$(kexec -a -l "${kernel_path}" \
+      ${final_initrd:+--initrd="${final_initrd}"} \
+      ${dtb_file:+--dtb="${dtb_file}"} \
+      --command-line="${root_prefix}${final_root_fs} ${real_cli_args} spl.splhostid=0x00000000" 2>&1)"; then
+      zerror "kexec -l failed: ${output}"
+      umount "${mntp}"
+      return 1
+   fi
+
+   umount "${mntp}"
+
+   while read -r _pool; do
+      if is_writable "${_pool}"; then
+         zdebug "${_pool} is read/write, exporting"
+         export_pool "${_pool}"
+      fi
+   done <<<"$( zpool list -H -o name )"
+
+   env "${hook_envs[@]}" /libexec/zfsbootmenu-run-hooks "teardown.d"
+
+   echo -e "\nBooting $( colorize yellow "${kernel_path##*/}" ) for $( colorize cyan "${main_fs}" ) ...\n"
+
+   if ! output="$( kexec -e -i 2>&1 )"; then
+      zerror "kexec -e failed: ${output}"
+      return 1
+   fi
 }
 
-# what a fix, change everything to just `zfs=`
 find_root_prefix() {
-  local zfsbe_mnt zfsbe_fs prefix
+   local zfsbe_mnt zfsbe_fs prefix
 
-  zfsbe_fs="${1}"
-  if [ -z "${zfsbe_fs}" ]; then
-    zerror "zfsbe_fs is undefined"
-    return 1
-  fi
-  zdebug "zfsbe_fs set to ${zfsbe_fs}"
+   zfsbe_fs="${1}"
+   if [ -z "${zfsbe_fs}" ]; then
+      zerror "zfsbe_fs is undefined"
+      return 1
+   fi
+   zdebug "zfsbe_fs set to ${zfsbe_fs}"
 
-  zfsbe_mnt="${2}"
-  if [ -z "${zfsbe_mnt}" ]; then
-    zerror "zfsbe_mnt is undefined"
-    return 1
-  fi
-  zdebug "zfsbe_mnt set to ${zfsbe_mnt}"
+   zfsbe_mnt="${2}"
+   if [ -z "${zfsbe_mnt}" ]; then
+      zerror "zfsbe_mnt is undefined"
+      return 1
+   fi
+   zdebug "zfsbe_mnt set to ${zfsbe_mnt}"
 
-  # Grab the root prefix from a property if possible
-  if prefix="$( zfs get -H -o value org.zfsbootmenu:rootprefix "${zfsbe_fs}" 2>/dev/null )"; then
-    if [ "${prefix}" != "-" ]; then
-      zdebug "using org.zfsbootmenu:rootprefix: ${prefix}"
-      echo "${prefix}"
-      return
-    fi
-  fi
+   if prefix="$( zfs get -H -o value org.zfsbootmenu:rootprefix "${zfsbe_fs}" 2>/dev/null )"; then
+      if [ "${prefix}" != "-" ]; then
+         zdebug "using org.zfsbootmenu:rootprefix: ${prefix}"
+         echo "${prefix}"
+         return
+      fi
+   fi
 
-  # Try looking at os-release in BE
-  if [ -n "${zfsbe_mnt}" ]; then
-    prefix=$(
-      # OS type is in ID and ID_LIKE variables; /etc supersedes /usr/lib
-      unset ID ID_LIKE
-      for osrel in ${zfsbe_mnt}/{usr/lib,etc}/os-release; do
-        if [ -r "${osrel}" ]; then
-          # shellcheck disable=SC1090
-          . "${osrel}" >/dev/null 2>&1
-        fi
-      done
+   if [ -n "${zfsbe_mnt}" ]; then
+      prefix=$(
+         unset ID ID_LIKE
+         for osrel in ${zfsbe_mnt}/{usr/lib,etc}/os-release; do
+            if [ -r "${osrel}" ]; then
+               . "${osrel}" >/dev/null 2>&1
+            fi
+         done
 
-      for ostype in $ID $ID_LIKE; do
-        case "$ostype" in
-          void|ubuntu|debian|devuan|chimera)
-            echo "zfs="
-            break
-            ;;
-          arch|artix)
-            echo "zfs="
-            break
-            ;;
-          gentoo|alpine)
-            echo "zfs="
-            break
-            ;;
-          *)
-            ;;
-        esac
-      done
-    )
+         for ostype in $ID $ID_LIKE; do
+            case "$ostype" in
+               void|ubuntu|debian|devuan|chimera)
+                  echo "zfs="
+                  break
+                  ;;
+               arch|artix)
+                  echo "zfs="
+                  break
+                  ;;
+               gentoo|alpine)
+                  echo "zfs="
+                  break
+                  ;;
+               *)
+                  ;;
+            esac
+         done
+      )
 
-    if [ -n "${prefix}" ]; then
-      zdebug "using os-release: ${prefix}"
-      echo "${prefix}"
-      return;
-    fi
-  fi
+      if [ -n "${prefix}" ]; then
+         zdebug "using os-release: ${prefix}"
+         echo "${prefix}"
+         return;
+      fi
+   fi
 
-  # Just return a default
-  zdebug "using default"
-  echo "zfs="
+   zdebug "using default"
+   echo "zfs="
 }

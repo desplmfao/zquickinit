@@ -1,0 +1,574 @@
+find_be_candidates() {
+   local candidates fs kernel bootfs rootfs active ret mountpoint
+
+   candidates=$(zfs get -H -o name -s local,inherited -t filesystem org.zfsbootmenu:kernel)
+
+   if [ -z "${candidates}" ]; then
+      return 1
+   fi
+
+   ret=1
+
+   while IFS=$'\t' read -r fs mountpoint bootfs rootfs active; do
+      if [ "${mountpoint}" != "/" ] && [ "${mountpoint}" != "legacy" ] && [ "${mountpoint}" != "none" ]; then
+         continue
+      fi
+
+      if [ "${active}" = "off" ]; then
+         continue
+      fi
+
+      if [ "${mountpoint}" = "legacy" ] && [ "${active}" != "on" ]; then
+         continue
+      fi
+
+      if [ "${fs}" = "${bootfs}" ]; then
+         continue
+      fi
+
+      if [ "${fs}" = "${rootfs}" ]; then
+         continue
+      fi
+
+      echo "${fs}"
+      ret=0
+   done <<< "$( echo "${candidates}" | xargs zfs list -H -o name,mountpoint,org.zfsbootmenu:bootfs,org.zfsbootmenu:rootfs,org.zfsbootmenu:active )"
+
+   return "${ret}"
+}
+
+populate_be_list() {
+   local be_list fs ret candidates
+
+   be_list="${1}"
+   if [ -z "${be_list}" ]; then
+      zerror "be_list is undefined"
+      return 1
+   fi
+   zdebug "be_list set to ${be_list}"
+
+   : > "${be_list}"
+
+   readarray -t candidates <<< "$( find_be_candidates 2>/dev/null )"
+
+   ret=1
+   for fs in "${candidates[@]}"; do
+      rm -f "$( be_location "${fs}" )/cmdline"
+
+      if find_be_kernels "${fs}"; then
+         echo "${fs}" >> "${be_list}"
+         ret=0
+      fi
+   done
+   return $ret
+}
+
+draw_kernel() {
+   local benv selected header expects _kernels selection_ret
+
+   benv="${1}"
+   if [ -z "${benv}" ]; then
+      zerror "benv is undefined"
+      return 130
+   fi
+
+   export ZQUICK_KERNEL_SCAN=1
+   find_be_kernels "${benv}"
+   unset ZQUICK_KERNEL_SCAN
+
+   while true; do
+      _kernels="$( be_location "${benv}" )/kernels"
+      if [ ! -r "${_kernels}" ] ; then
+         zerror "kernel file ${_kernels} missing"
+         return 130
+      fi
+
+      zdebug "using kernels file: ${_kernels}"
+
+      header="$( column_wrap "\
+^[RETURN] boot:[ESCAPE] back
+^[CTRL+D] set default:[CTRL+U] unset default
+^[CTRL+L] view logs:[CTRL+R] rescan (unlock)" \
+"\
+^[RETURN] boot
+^[CTRL+D] set default
+^[CTRL+R] rescan" )"
+
+      expects="--expect=alt-d,alt-u,alt-r,left,right"
+
+      selected="$( HELP_SECTION=kernel-management ${FUZZYSEL} \
+         --prompt "${benv} > " --tac --delimiter=$'\t' --with-nth=2 \
+         --header="${header}" ${HAS_BORDER:+--border-label="$( global_header )"} \
+         ${expects} ${expects//alt-/ctrl-} ${expects//alt-/ctrl-alt-} \
+         --preview="/libexec/zfsbootmenu-preview '${benv}' '${BOOTFS}'"  \
+         --preview-window="up:${PREVIEW_HEIGHT}${HAS_BORDER:+,border-sharp}" < "${_kernels}" )"
+
+      selection_ret=$?
+
+      if [ $selection_ret -ne 0 ]; then
+         return 1
+      fi
+
+      # shellcheck disable=SC2119
+      selected="$( csv_cat <<< "${selected}" )"
+
+      if [[ "${selected}" == "ctrl-r"* ]] || [[ "${selected}" == "alt-r"* ]] || [[ "${selected}" == "mod-r"* ]]; then
+         zdebug "Rescan requested for ${benv}"
+
+         export ZQUICK_KERNEL_SCAN=1
+         find_be_kernels "${benv}"
+         unset ZQUICK_KERNEL_SCAN
+
+         continue
+      fi
+
+      echo "${selected}"
+      zdebug "selected: ${selected}"
+      return 0
+   done
+}
+
+draw_be() {
+   local env selected header expects kcl_text kcl_bind blank sort_key preview_label target_env
+
+   env="${1}"
+   if [ -z "${env}" ]; then
+      zerror "environment file is undefined"
+      return 130
+   fi
+
+   if [ ! -r "${env}" ] ; then
+      zerror "environment file ${env} is missing"
+      return 130
+   fi
+
+   zdebug "using environment file: ${env}"
+
+   # this is horrible btw
+   if [ ! -f /tmp/zbm_race_fixed ]; then
+      touch /tmp/zbm_race_fixed
+      zdebug "simulating Ctrl+D to fix race condition..."
+
+      sleep 1
+
+      if [ -n "${BOOTFS}" ] && grep -Fqx "${BOOTFS}" "${env}"; then
+         target_env="${BOOTFS}"
+      else
+         read -r target_env < "${env}"
+      fi
+
+      echo "mod-d,${target_env}"
+
+      return 0
+   fi
+
+   if [ -f "${BASE}/cmdline" ]; then
+      kcl_text="[CTRL+T] revert kcl"
+      kcl_bind="alt-t"
+      blank=
+   else
+      blank=':'
+   fi
+
+   header="$( column_wrap "\
+^[RETURN] boot:[CTRL+K] kernels:[CTRL+P] pool status
+^[CTRL+D] set bootfs:[CTRL+J] jump into chroot:[CTRL+L] view logs
+^[CTRL+S] snapshots:[CTRL+R] recovery shell:[CTRL+X] power menu
+^[CTRL+E] edit kcl${kcl_text:+:${kcl_text}}:${blank}[CTRL+H] help" \
+"\
+^[RETURN] boot
+^[CTRL+R] recovery shell
+^[CTRL+H] help" )"
+
+   sort_key="$( get_sort_key )"
+   preview_label="Sorted by: ${sort_key^}"
+
+   expects="--expect=alt-e,alt-k,alt-d,alt-s,alt-c,alt-r,alt-p,alt-w,alt-j,alt-o,alt-x${kcl_bind:+,${kcl_bind}},right"
+
+   # shellcheck disable=SC2086
+   if ! selected="$( ${FUZZYSEL} -0 --prompt "BE > " \
+      ${expects} ${expects//alt-/ctrl-} ${expects//alt-/ctrl-alt-} \
+      ${HAS_BORDER:+--border-label="$( global_header )"} \
+      ${HAS_BORDER:+--preview-label-pos=2:bottom} \
+      ${HAS_BORDER:+--preview-label="$( colorize orange " ${preview_label} " )"} \
+      --header="${header}" --preview-window="up:${PREVIEW_HEIGHT}${HAS_BORDER:+,border-sharp}" \
+      --preview="/libexec/zfsbootmenu-preview {} '${BOOTFS}'" < "${env}" )"; then
+      return 1
+   fi
+
+   # shellcheck disable=SC2119
+   selected="$( csv_cat <<< "${selected}" )"
+   echo "${selected}"
+   zdebug "selected: ${selected}"
+
+   return 0
+}
+
+draw_snapshots() {
+   local benv selected header expects sort_key snapshots note sorted_by context
+   local prop_rootfs prop_bootfs view_target view_label selection_ret tcols
+
+   benv="${1}"
+   if [ -z "${benv}" ]; then
+      zerror "benv is undefined"
+      return 130
+   fi
+
+   zdebug "using boot environment: ${benv}"
+
+   prop_rootfs="$(zfs get -H -o value org.zfsbootmenu:rootfs "${benv}" 2>/dev/null)"
+   prop_bootfs="$(zfs get -H -o value org.zfsbootmenu:bootfs "${benv}" 2>/dev/null)"
+
+   [ "${prop_rootfs}" == "-" ] && prop_rootfs=""
+   [ "${prop_bootfs}" == "-" ] && prop_bootfs=""
+
+   if [ -n "${prop_rootfs}" ] && [ "${prop_rootfs}" != "${benv}" ]; then
+      view_target="${prop_rootfs}"
+      view_label="ROOTFS"
+   else
+      view_target="${benv}"
+      view_label="BASE"
+   fi
+
+   while true; do
+      header="$( column_wrap "\
+^[RETURN] duplicate:[CTRL+C] clone only:[CTRL+X] clone and promote
+^[CTRL+D] show diff:[CTRL+R] rollback:[CTRL+N] create new snapshot
+^[CTRL+L] view logs:[CTRL+T] switch view [${view_label}]
+^[CTRL+H] help::[ESCAPE] back" \
+"\
+^[RETURN] duplicate
+^[CTRL+D] show diff
+^[CTRL+H] help" )"
+
+      sort_key="$( get_sort_key )"
+      sorted_by="Sorted by: ${sort_key^}"
+      note="Note: showing snapshots for ${view_target}"
+
+      tcols=$(tput cols)
+      [ -z "$tcols" ] && tcols=80
+
+      local LEGACY_CONTEXT
+      if [ -n "${HAS_BORDER}" ] ; then
+         local spacer preview_offset
+         spacer=$(( ( ( tcols - ${#note} ) / 2 ) - ${#sorted_by} - 4 ))
+         if [ "${spacer}" -gt 0 ]; then
+            preview_offset="2:"
+            printf -v spacer "%*s" "${spacer}" ""
+            spacer="${spacer// /─}"
+            note="$( colorize orange "${note}" )"
+            sorted_by="$( colorize orange "${sorted_by}" )"
+            printf -v context " %s %s %s " "${sorted_by}" "${spacer}" "${note}"
+         elif [ ${tcols} -gt $(( ${#note} + 2 )) ]; then
+            printf -v context " %s " "$( colorize orange "${note}" )"
+         elif [ ${tcols} -gt $(( ${#sorted_by} +2 )) ]; then
+            preview_offset="2:"
+            printf -v context " %s " "$( colorize orange "${sorted_by}" )"
+         else
+            context=""
+         fi
+      else
+         LEGACY_CONTEXT=1
+         context="${note}"
+      fi
+
+      expects="--expect=alt-x,alt-c,alt-j,alt-o,alt-n,alt-r,alt-t,left,right"
+
+      snapshots="$( zfs list -t snapshot -H -o name -S "${sort_key}" "${view_target}" )"
+      snapshots="${snapshots:-No snapshots available}"
+
+      selected="$(\
+         HELP_SECTION=snapshot-management ${FUZZYSEL} \
+            --prompt "snapshot > " --header="${header}" --tac --multi 2 \
+            ${HAS_BORDER:+--border-label="$( global_header )"} \
+            ${expects} ${expects//alt-/ctrl-} ${expects//alt-/ctrl-alt-} \
+            --bind="alt-d:execute[ /libexec/zfsbootmenu-diff {+} ]${HAS_REFRESH:++refresh-preview}" \
+            --bind="ctrl-d:execute[ /libexec/zfsbootmenu-diff {+} ]${HAS_REFRESH:++refresh-preview}" \
+            --bind="ctrl-alt-d:execute[ /libexec/zfsbootmenu-diff {+} ]${HAS_REFRESH:++refresh-preview}" \
+            ${HAS_BORDER:+--preview-label-pos=${preview_offset:+${preview_offset}}bottom} \
+            ${HAS_BORDER:+--preview-label="${context}"} \
+            --preview="/libexec/zfsbootmenu-preview '${benv}' '${BOOTFS}' ${LEGACY_CONTEXT:+\"${context}\"}" \
+            --preview-window="up:$(( PREVIEW_HEIGHT + ${LEGACY_CONTEXT:-0} ))${HAS_BORDER:+,border-sharp}" <<<"${snapshots}" )"
+      
+      selection_ret=$?
+
+      if [ $selection_ret -ne 0 ]; then
+         return 1
+      fi
+
+      selected="$( csv_cat <<< "${selected}" )"
+
+      if [[ "${selected}" == "mod-t"* ]]; then
+         if [ "${view_target}" == "${benv}" ]; then
+            if [ -n "${prop_rootfs}" ] && [ "${prop_rootfs}" != "${benv}" ]; then
+               view_target="${prop_rootfs}"
+               view_label="ROOTFS"
+            elif [ -n "${prop_bootfs}" ] && [ "${prop_bootfs}" != "${benv}" ]; then
+               view_target="${prop_bootfs}"
+               view_label="BOOTFS"
+            fi
+         elif [ "${view_target}" == "${prop_rootfs}" ]; then
+            if [ -n "${prop_bootfs}" ] && [ "${prop_bootfs}" != "${benv}" ] && [ "${prop_bootfs}" != "${prop_rootfs}" ]; then
+               view_target="${prop_bootfs}"
+               view_label="BOOTFS"
+            else
+               view_target="${benv}"
+               view_label="BASE"
+            fi
+         else
+            view_target="${benv}"
+            view_label="BASE"
+         fi
+
+         continue
+      fi
+
+      echo "${selected}"
+      zdebug "selected: ${selected}"
+      return 0
+   done
+}
+
+snapshot_dispatcher() {
+   local selected subkey
+   local parent_ds avail_space_exact be_size_exact leftover_space avail_space be_size
+   local prompt header check_base pre_populated user_input valid_name clone_target
+   local snap_name fs_name
+
+   selected="${1}"
+   if [ -z "$selected" ]; then
+      zerror "selected is undefined"
+
+      return 1
+   fi
+   zdebug "selected: ${selected}"
+
+   subkey="${2}"
+   if [ -z "$subkey" ]; then
+      zerror "subkey is undefined"
+
+      return 1
+   fi
+   zdebug "subkey: ${subkey}"
+
+   if [ "${subkey}" = "mod-r" ]; then
+      rollback_snapshot "${selected}"
+
+      return
+   fi
+
+   parent_ds="${selected%/*}"
+   parent_ds="${parent_ds%@*}"
+
+   if [ -z "${parent_ds}" ]; then
+      zerror "unable to determine parent dataset for ${selected}"
+
+      return 1
+   fi
+   zdebug "parent_ds: ${parent_ds}"
+
+   if [ "${subkey}" = "enter" ]; then
+      avail_space_exact="$( zfs list -p -H -o available "${parent_ds}" )"
+      be_size_exact="$( zfs list -p -H -o refer "${selected}" )"
+      leftover_space=$(( avail_space_exact - be_size_exact ))
+
+      if [ "${leftover_space}" -le 0 ]; then
+         avail_space="$( zfs list -H -o available "${parent_ds}" )"
+         be_size="$( zfs list -H -o refer "${selected}" )"
+
+         zerror "insufficient space for duplication, ${parent_ds}' has ${avail_space} free but needs ${be_size}"
+         timed_prompt -m "$( colorize red "insufficient space for duplication" )" \
+            -m "'$( colorize magenta "${parent_ds}" )' has ${avail_space} free but needs ${be_size}"
+         return 1
+      fi
+   fi
+
+   case "${subkey}" in
+      "enter"|"mod-x"|"mod-c")
+         prompt="\nNew boot environment name (CTRL-C or leave blank to abort)"
+         header="$( center_string "${selected}" )"
+         check_base="${parent_ds}/"
+
+         snap_name="${selected##*@}"
+         fs_name="${parent_ds##*/}"
+         pre_populated="${fs_name}_${snap_name}"
+         ;;
+      "mod-n")
+         prompt="\nNew snapshot name (CTRL-C or leave blank to abort)"
+         header="$( center_string "${selected%%@*}" )"
+         check_base="${selected%%@*}@"
+
+         pre_populated="$( printf "%(%Y-%m-%d-%H%M%S)T" )"
+         ;;
+   esac
+
+   tput clear
+   tput cnorm
+   colorize green "${header}"
+
+   while true; do
+      echo -e "${prompt}"
+      user_input="$( /libexec/zfsbootmenu-input "${pre_populated}" )"
+
+      [ -n "${user_input}" ] || return
+
+      shopt -s extglob
+      valid_name="${user_input//+([!a-zA-Z0-9-_.:])/}"
+      shopt -u extglob
+
+      if [[ "${user_input}" != "${valid_name}" ]]; then
+         echo "${user_input} is invalid, ${valid_name} can be used"
+         pre_populated="${valid_name}"
+      elif zfs list -H -o name "${check_base}${user_input}" >/dev/null 2>&1; then
+         echo "${check_base}${user_input} already exists, please use another name"
+         pre_populated="${user_input}"
+      else
+         break
+      fi
+   done
+
+   [ -n "${user_input}" ] || return
+
+   case "${subkey}" in
+      "enter"|"mod-x"|"mod-c")
+         clone_target="${parent_ds}/${user_input}"
+         be_size="$( zfs list -H -o refer "${selected}" )"
+         echo -e "\nCreating ${clone_target} from ${selected} (${be_size})"
+         ;;
+   esac
+
+   case "${subkey}" in
+      "enter")
+         duplicate_snapshot "${selected}" "${clone_target}"
+         ;;
+      "mod-x")
+         PROMOTE=1 clone_snapshot "${selected}" "${clone_target}"
+         ;;
+      "mod-c")
+         clone_snapshot "${selected}" "${clone_target}"
+         ;;
+      "mod-n")
+         create_snapshot "${selected%%@*}" "${user_input}"
+
+         # shellcheck disable=SC2034
+         BE_SELECTED=1
+         ;;
+   esac
+}
+
+clone_snapshot() {
+   local selected target pool opts parent parent_fs snap_name
+   local p_rootfs p_bootfs child_suffix target_child source_snap
+   local target_container target_root target_boot latest_snap
+
+   selected="${1}"
+   if [ -z "$selected" ]; then
+      zerror "selected is undefined"
+      return 1
+   fi
+   zdebug "selected: ${selected}"
+
+   target="${2}"
+   if [ -z "$target" ]; then
+      zerror "target is undefined"
+      return 1
+   fi
+   zdebug "target: ${target}"
+
+   pool="${selected%%/*}"
+   if ! set_rw_pool "${pool}" ; then
+      zerror "unable to set pool ${pool} read/write"
+      return 1
+   fi
+
+   snap_name="${selected#*@}"
+   parent="${selected%%@*}"
+   
+   local container="${parent}"
+   if [[ "${container}" == */root ]] || [[ "${container}" == */boot ]]; then
+      container="${container%/*}"
+   fi
+
+   local c_rootfs c_bootfs
+   c_rootfs="$(zfs get -H -o value org.zfsbootmenu:rootfs "${container}" 2>/dev/null)"
+   c_bootfs="$(zfs get -H -o value org.zfsbootmenu:bootfs "${container}" 2>/dev/null)"
+
+   if [[ "${c_rootfs}" != "${parent}" && "${c_bootfs}" != "${parent}" && "${container}" != "${parent}" ]]; then
+      zdebug "selected dataset ${parent} does not appear to be part of structured be ${container}"
+
+      zfs clone -o mountpoint=/ -o canmount=noauto "${selected}" "${target}"
+
+      return $?
+   fi
+
+   target_container="${target}"
+   
+   if ! zfs list "${target_container}" >/dev/null 2>&1; then
+      if zfs list -t snapshot "${container}@${snap_name}" >/dev/null 2>&1; then
+         zdebug "cloning container from ${container}@${snap_name}"
+
+         zfs clone -o mountpoint=none -o canmount=noauto "${container}@${snap_name}" "${target_container}"
+      else
+         zdebug "creating new container ${target_container}"
+
+         zfs create -o mountpoint=none -o canmount=noauto "${target_container}"
+      fi
+   fi
+
+   if [[ -n "${c_rootfs}" ]]; then
+      local root_snap="${c_rootfs}@${snap_name}"
+      
+      if ! zfs list -t snapshot "${root_snap}" >/dev/null 2>&1; then
+         latest_snap="$(zfs list -t snapshot -H -o name -S creation -d 1 "${c_rootfs}" | head -n 1)"
+         if [[ -n "${latest_snap}" ]]; then
+            zdebug "snapshot ${root_snap} missing, using latest: ${latest_snap}"
+
+            root_snap="${latest_snap}"
+         else
+            zerror "no snapshots found for ${c_rootfs}, cannot clone rootfs"
+         fi
+      fi
+
+      if zfs list -t snapshot "${root_snap}" >/dev/null 2>&1; then
+         target_root="${target_container}/${c_rootfs##*/}"
+
+         zdebug "cloning rootfs ${root_snap} -> ${target_root}"
+
+         zfs clone -o mountpoint=/ -o canmount=noauto "${root_snap}" "${target_root}"
+         zfs set org.zfsbootmenu:rootfs="${target_root}" "${target_container}"
+      fi
+   fi
+
+   if [[ -n "${c_bootfs}" ]]; then
+      local boot_snap="${c_bootfs}@${snap_name}"
+
+      if ! zfs list -t snapshot "${boot_snap}" >/dev/null 2>&1; then
+         latest_snap="$(zfs list -t snapshot -H -o name -S creation -d 1 "${c_bootfs}" | head -n 1)"
+
+         if [[ -n "${latest_snap}" ]]; then
+            zdebug "snapshot ${boot_snap} missing, using latest: ${latest_snap}"
+
+            boot_snap="${latest_snap}"
+         else
+            zerror "no snapshots found for ${c_bootfs}, cannot clone bootfs"
+         fi
+      fi
+
+      if zfs list -t snapshot "${boot_snap}" >/dev/null 2>&1; then
+         target_boot="${target_container}/${c_bootfs##*/}"
+
+         zdebug "cloning bootfs ${boot_snap} -> ${target_boot}"
+
+         zfs clone -o mountpoint=legacy -o canmount=noauto "${boot_snap}" "${target_boot}"
+         zfs set org.zfsbootmenu:bootfs="${target_boot}" "${target_container}"
+      fi
+   fi
+
+   if [ -n "${PROMOTE}" ]; then
+      zdebug "promoting ${target_container} children"
+      [ -n "${target_root}" ] && zfs promote "${target_root}"
+      [ -n "${target_boot}" ] && zfs promote "${target_boot}"
+   fi
+
+   return 0
+}
